@@ -63,44 +63,42 @@ past information, and tracking changes to websites over time.""".strip(),
 )
 
 
-async def find_snapshot_before_date(url: str, target_date: str) -> dict | None:
+async def find_snapshot_before_date(client: httpx.AsyncClient, url: str, target_date: str) -> dict | None:
     """Query the CDX API to find the most recent snapshot at or before target_date."""
     timestamp = target_date.replace("-", "")
-    async with httpx.AsyncClient(timeout=30) as client:
-        params = {
-            "url": url,
-            "output": "json",
-            "fl": "timestamp,original,statuscode",
-            "filter": "statuscode:200",
-            "to": timestamp,  # Only snapshots up to this date
-            "limit": 1,
-            "sort": "reverse",  # Most recent first
-        }
-        resp = await client.get(WAYBACK_CDX_API, params=params)
-        resp.raise_for_status()
-        try:
-            data = resp.json()
-            if len(data) > 1:  # First row is header, second is data
-                headers = data[0]
-                row = data[1]
-                row_dict = dict(zip(headers, row))
-                timestamp = row_dict.get("timestamp", "")
-                original_url = row_dict.get("original", url)
-                return {
-                    "timestamp": timestamp,
-                    "url": f"{WAYBACK_BASE_URL}/{timestamp}/{original_url}",
-                }
-        except json.JSONDecodeError:
-            pass
+    params = {
+        "url": url,
+        "output": "json",
+        "fl": "timestamp,original,statuscode",
+        "filter": "statuscode:200",
+        "to": timestamp,  # Only snapshots up to this date
+        "limit": 1,
+        "sort": "reverse",  # Most recent first
+    }
+    resp = await client.get(WAYBACK_CDX_API, params=params)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+        if len(data) > 1:  # First row is header, second is data
+            headers = data[0]
+            row = data[1]
+            row_dict = dict(zip(headers, row))
+            timestamp = row_dict.get("timestamp", "")
+            original_url = row_dict.get("original", url)
+            return {
+                "timestamp": timestamp,
+                "url": f"{WAYBACK_BASE_URL}/{timestamp}/{original_url}",
+            }
+    except json.JSONDecodeError:
+        pass
     return None
 
 
-async def fetch_archived_page(archive_url: str) -> str:
+async def fetch_archived_page(client: httpx.AsyncClient, archive_url: str) -> str:
     """Fetch the archived page content and convert to text."""
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-        resp = await client.get(archive_url)
-        resp.raise_for_status()
-        html_content = resp.text
+    resp = await client.get(archive_url)
+    resp.raise_for_status()
+    html_content = resp.text
 
     h = html2text.HTML2Text()
     h.ignore_links = False
@@ -199,24 +197,26 @@ async def get_archived_snapshot(
     snapshot = None
     matched_url = url
 
-    for url_variant in url_variations:
-        snapshot = await find_snapshot_before_date(url_variant, target_date)
-        if snapshot:
-            matched_url = url_variant
-            break
+    # Use single client for all operations to avoid connection pool exhaustion
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        for url_variant in url_variations:
+            snapshot = await find_snapshot_before_date(client, url_variant, target_date)
+            if snapshot:
+                matched_url = url_variant
+                break
 
-    if not snapshot:
-        tried = ", ".join(url_variations)
-        return f"No archived snapshot found for '{url}' at or before {target_date}. Tried URL variations: {tried}. The page may not be archived in the Wayback Machine."
+        if not snapshot:
+            tried = ", ".join(url_variations)
+            return f"No archived snapshot found for '{url}' at or before {target_date}. Tried URL variations: {tried}. The page may not be archived in the Wayback Machine."
 
-    snapshot_timestamp = snapshot.get("timestamp", "")
-    snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
+        snapshot_timestamp = snapshot.get("timestamp", "")
+        snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
 
-    archive_url = snapshot.get("url", "")
-    if not archive_url:
-        return f"Error: Could not retrieve archive URL for '{matched_url}'."
+        archive_url = snapshot.get("url", "")
+        if not archive_url:
+            return f"Error: Could not retrieve archive URL for '{matched_url}'."
 
-    content = await fetch_archived_page(archive_url)
+        content = await fetch_archived_page(client, archive_url)
 
     result = f"""## Archived Snapshot
 **Original URL:** {url}
