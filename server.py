@@ -101,6 +101,29 @@ def parse_wayback_timestamp(timestamp: str) -> str:
     return timestamp
 
 
+def get_url_variations(url: str) -> list[str]:
+    """Generate URL variations to try (e.g., with .html, trailing slash)."""
+    variations = [url]
+
+    # Don't add variations if URL already has a file extension or query string
+    if "?" in url or url.endswith("/"):
+        return variations
+
+    # Check if URL already has a common extension
+    path = url.split("?")[0]
+    if path.endswith((".html", ".htm", ".php", ".asp", ".aspx", ".jsp")):
+        return variations
+
+    # Add common variations
+    variations.extend([
+        url + ".html",
+        url + ".htm",
+        url + "/",
+    ])
+
+    return variations
+
+
 @mcp.tool(
     name="get_archived_snapshot",
     title="Get Archived Snapshot",
@@ -144,31 +167,43 @@ async def get_archived_snapshot(
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    snapshot = await find_closest_snapshot(url, target_date)
+    # Try URL variations (original, .html, .htm, /) to find snapshots
+    url_variations = get_url_variations(url)
+    snapshot = None
+    matched_url = url
+
+    for url_variant in url_variations:
+        snapshot = await find_closest_snapshot(url_variant, target_date)
+        if snapshot:
+            # Verify snapshot is before target date
+            snapshot_timestamp = snapshot.get("timestamp", "")
+            snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
+            try:
+                snapshot_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
+                if snapshot_dt <= target_dt:
+                    matched_url = url_variant
+                    break
+            except ValueError:
+                matched_url = url_variant
+                break
+        snapshot = None
 
     if not snapshot:
-        return f"No archived snapshot found for '{url}' at or before {target_date}. The page may not be archived in the Wayback Machine."
+        tried = ", ".join(url_variations)
+        return f"No archived snapshot found for '{url}' at or before {target_date}. Tried URL variations: {tried}. The page may not be archived in the Wayback Machine."
 
-    # Check if snapshot is available and before target date
     snapshot_timestamp = snapshot.get("timestamp", "")
     snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
 
-    # Verify snapshot is not after target date
-    try:
-        snapshot_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
-        if snapshot_dt > target_dt:
-            return f"No archived snapshot found for '{url}' at or before {target_date}. Closest available snapshot is from {snapshot_date}, which is after your target date."
-    except ValueError:
-        pass
-
     archive_url = snapshot.get("url", "")
     if not archive_url:
-        return f"Error: Could not retrieve archive URL for '{url}'."
+        return f"Error: Could not retrieve archive URL for '{matched_url}'."
 
     content = await fetch_archived_page(archive_url)
 
     result = f"""## Archived Snapshot
 **Original URL:** {url}
+**Matched URL:** {matched_url}
 **Snapshot Date:** {snapshot_date}
 **Archive URL:** {archive_url}
 
@@ -209,53 +244,57 @@ async def list_available_snapshots(
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
-    params = {
-        "url": url,
-        "output": "json",
-        "fl": "timestamp,original,statuscode",
-        "filter": "statuscode:200",  # Only successful captures
-        "collapse": "timestamp:8",  # One per day (YYYYMMDD)
-        "limit": limit * 2,  # Fetch extra in case some are filtered out
-        "sort": "reverse",  # Most recent snapshots first
-    }
-
-    if start_date:
-        params["from"] = start_date.replace("-", "")
-    if end_date:
-        params["to"] = end_date.replace("-", "")
+    # Try URL variations to find snapshots
+    url_variations = get_url_variations(url)
+    data = None
+    matched_url = url
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(WAYBACK_CDX_API, params=params)
-        resp.raise_for_status()
+        for url_variant in url_variations:
+            params = {
+                "url": url_variant,
+                "output": "json",
+                "fl": "timestamp,original,statuscode",
+                "filter": "statuscode:200",
+                "collapse": "timestamp:8",
+                "limit": limit * 2,
+                "sort": "reverse",
+            }
+            if start_date:
+                params["from"] = start_date.replace("-", "")
+            if end_date:
+                params["to"] = end_date.replace("-", "")
 
-        try:
-            data = resp.json()
-        except json.JSONDecodeError:
-            # CDX API returns empty response for no results
-            return json.dumps({
-                "url": url,
-                "snapshots": [],
-                "message": f"No archived snapshots found for '{url}'" +
-                          (f" between {start_date} and {end_date}" if start_date or end_date else "")
-            }, indent=2)
+            resp = await client.get(WAYBACK_CDX_API, params=params)
+            resp.raise_for_status()
 
-    # First row is header, rest are data
-    if len(data) <= 1:
+            try:
+                variant_data = resp.json()
+                if len(variant_data) > 1:  # Has results (first row is header)
+                    data = variant_data
+                    matched_url = url_variant
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    if not data or len(data) <= 1:
+        tried = ", ".join(url_variations)
         return json.dumps({
             "url": url,
+            "tried_variations": url_variations,
             "snapshots": [],
-            "message": f"No archived snapshots found for '{url}'" +
+            "message": f"No archived snapshots found. Tried: {tried}" +
                       (f" between {start_date} and {end_date}" if start_date or end_date else "")
         }, indent=2)
 
     headers = data[0]
     snapshots = []
 
-    for row in data[1:limit + 1]:  # Skip header, limit results
+    for row in data[1:limit + 1]:
         row_dict = dict(zip(headers, row))
         timestamp = row_dict.get("timestamp", "")
         snapshot_date = parse_wayback_timestamp(timestamp)
-        archive_url = f"{WAYBACK_BASE_URL}/{timestamp}/{row_dict.get('original', url)}"
+        archive_url = f"{WAYBACK_BASE_URL}/{timestamp}/{row_dict.get('original', matched_url)}"
 
         snapshots.append({
             "date": snapshot_date,
@@ -265,6 +304,7 @@ async def list_available_snapshots(
 
     result = {
         "url": url,
+        "matched_url": matched_url,
         "total_found": len(snapshots),
         "date_range": {
             "start": start_date,
