@@ -200,7 +200,7 @@ async def list_available_snapshots(
     url: Annotated[str, "The URL to check for snapshots (e.g., 'example.com' or 'https://example.com/page')"],
     start_date: Annotated[str | None, "Start of date range in YYYY-MM-DD format (optional)"] = None,
     end_date: Annotated[str | None, "End of date range in YYYY-MM-DD format (optional)"] = None,
-    limit: Annotated[int, "Maximum number of snapshots to return (default 10, max 50)"] = 10,
+    limit: Annotated[int, "Maximum number of snapshots to return (default 20, max 50)"] = 20,
 ) -> str:
     # Validate and cap limit
     limit = min(max(1, limit), 50)
@@ -216,6 +216,7 @@ async def list_available_snapshots(
         "filter": "statuscode:200",  # Only successful captures
         "collapse": "timestamp:8",  # One per day (YYYYMMDD)
         "limit": limit * 2,  # Fetch extra in case some are filtered out
+        "sort": "reverse",  # Most recent snapshots first
     }
 
     if start_date:
