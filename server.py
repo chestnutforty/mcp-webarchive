@@ -18,7 +18,6 @@ from rate_limiter import RateLimiter, rate_limited
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 MCP_NAME = "webarchive"
 
-WAYBACK_AVAILABILITY_API = "https://archive.org/wayback/available"
 WAYBACK_CDX_API = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE_URL = "https://web.archive.org/web"
 
@@ -64,15 +63,35 @@ past information, and tracking changes to websites over time.""".strip(),
 )
 
 
-async def find_closest_snapshot(url: str, target_date: str) -> dict | None:
-    """Query the Wayback Machine availability API to find the closest snapshot."""
+async def find_snapshot_before_date(url: str, target_date: str) -> dict | None:
+    """Query the CDX API to find the most recent snapshot at or before target_date."""
     timestamp = target_date.replace("-", "")
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(WAYBACK_AVAILABILITY_API, params={"url": url, "timestamp": timestamp})
+        params = {
+            "url": url,
+            "output": "json",
+            "fl": "timestamp,original,statuscode",
+            "filter": "statuscode:200",
+            "to": timestamp,  # Only snapshots up to this date
+            "limit": 1,
+            "sort": "reverse",  # Most recent first
+        }
+        resp = await client.get(WAYBACK_CDX_API, params=params)
         resp.raise_for_status()
-        data = resp.json()
-        if "archived_snapshots" in data and "closest" in data["archived_snapshots"]:
-            return data["archived_snapshots"]["closest"]
+        try:
+            data = resp.json()
+            if len(data) > 1:  # First row is header, second is data
+                headers = data[0]
+                row = data[1]
+                row_dict = dict(zip(headers, row))
+                timestamp = row_dict.get("timestamp", "")
+                original_url = row_dict.get("original", url)
+                return {
+                    "timestamp": timestamp,
+                    "url": f"{WAYBACK_BASE_URL}/{timestamp}/{original_url}",
+                }
+        except json.JSONDecodeError:
+            pass
     return None
 
 
@@ -181,20 +200,10 @@ async def get_archived_snapshot(
     matched_url = url
 
     for url_variant in url_variations:
-        snapshot = await find_closest_snapshot(url_variant, target_date)
+        snapshot = await find_snapshot_before_date(url_variant, target_date)
         if snapshot:
-            # Verify snapshot is before target date
-            snapshot_timestamp = snapshot.get("timestamp", "")
-            snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
-            try:
-                snapshot_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
-                if snapshot_dt <= target_dt:
-                    matched_url = url_variant
-                    break
-            except ValueError:
-                matched_url = url_variant
-                break
-        snapshot = None
+            matched_url = url_variant
+            break
 
     if not snapshot:
         tried = ", ".join(url_variations)
