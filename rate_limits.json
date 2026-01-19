@@ -1,0 +1,7 @@
+{
+  "max_requests_per_second": 5,
+  "hard_limit": null,
+  "max_wait_seconds": 120,
+  "tools": {},
+  "notes": "Internet Archive Wayback Machine API has no strict rate limits but requests should be reasonable. Set conservative default to be a good citizen."
+}
