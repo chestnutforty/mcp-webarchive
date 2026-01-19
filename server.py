@@ -13,6 +13,8 @@ import html2text
 import httpx
 from fastmcp import FastMCP
 
+from rate_limiter import RateLimiter, rate_limited
+
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 MCP_NAME = "webarchive"
 
@@ -50,6 +52,8 @@ def notify_on_error(func):
             raise
     return wrapper
 
+
+_limiter = RateLimiter()
 
 mcp = FastMCP(
     name="webarchive",
@@ -132,6 +136,9 @@ def get_url_variations(url: str) -> list[str]:
 Use this tool when you need to see how a webpage looked at a specific point in the past. The tool will find
 the closest available snapshot before or on the target date and return its content as readable text.
 
+Tip: If unsure whether a page is archived, first use list_available_snapshots to see available dates,
+then call this tool with a date from those results.
+
 Examples:
 - To check a company's team page from 6 months ago: get_archived_snapshot(url="example.com/team", target_date="2024-06-01")
 - To verify historical product pricing: get_archived_snapshot(url="store.com/pricing", target_date="2023-01-15")
@@ -142,6 +149,7 @@ Note: Not all pages are archived, and archive frequency varies. The tool returns
     exclude_args=["cutoff_date"],
     meta={"when_to_use": "Use when you need historical webpage content for forecasting questions about organization changes, website history, or verifying past information."},
 )
+@rate_limited(_limiter)
 @notify_on_error
 async def get_archived_snapshot(
     url: Annotated[str, "The URL to fetch from the archive (e.g., 'example.com/page' or 'https://example.com/page')"],
@@ -222,23 +230,39 @@ async def get_archived_snapshot(
 Use this tool to discover what archived versions of a webpage exist before fetching specific content.
 This helps you identify which dates have captures available.
 
+Workflow:
+1. Call list_available_snapshots to see what dates have archived versions
+2. Pick a date from the results
+3. Call get_archived_snapshot with that date as target_date to fetch the content
+
 Examples:
 - To find all snapshots of a page in 2024: list_available_snapshots(url="example.com", start_date="2024-01-01", end_date="2024-12-31")
 - To check recent archive coverage: list_available_snapshots(url="company.com/team", limit=5)
 
 Returns a list of available snapshot dates with their archive URLs.""",
-    tags={"output:medium", "format:json"},
+    tags={"backtesting_supported", "output:medium", "format:json"},
+    exclude_args=["cutoff_date"],
     meta={"when_to_use": "Use to discover available archive dates before fetching specific snapshots, especially when unsure about archive coverage."},
 )
+@rate_limited(_limiter)
 @notify_on_error
 async def list_available_snapshots(
     url: Annotated[str, "The URL to check for snapshots (e.g., 'example.com' or 'https://example.com/page')"],
     start_date: Annotated[str | None, "Start of date range in YYYY-MM-DD format (optional)"] = None,
     end_date: Annotated[str | None, "End of date range in YYYY-MM-DD format (optional)"] = None,
     limit: Annotated[int, "Maximum number of snapshots to return (default 20, max 50)"] = 20,
+    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
 ) -> str:
     # Validate and cap limit
     limit = min(max(1, limit), 50)
+
+    # For backtesting: cap end_date at cutoff_date to prevent leakage
+    effective_end_date = end_date
+    if cutoff_date:
+        if end_date is None:
+            effective_end_date = cutoff_date
+        else:
+            effective_end_date = min(end_date, cutoff_date)
 
     # Normalize URL
     if not url.startswith(("http://", "https://")):
@@ -262,8 +286,8 @@ async def list_available_snapshots(
             }
             if start_date:
                 params["from"] = start_date.replace("-", "")
-            if end_date:
-                params["to"] = end_date.replace("-", "")
+            if effective_end_date:
+                params["to"] = effective_end_date.replace("-", "")
 
             resp = await client.get(WAYBACK_CDX_API, params=params)
             resp.raise_for_status()
@@ -290,10 +314,28 @@ async def list_available_snapshots(
     headers = data[0]
     snapshots = []
 
+    # Parse cutoff for filtering
+    cutoff_dt = None
+    if cutoff_date:
+        try:
+            cutoff_dt = datetime.strptime(cutoff_date, "%Y-%m-%d")
+        except ValueError:
+            pass
+
     for row in data[1:limit + 1]:
         row_dict = dict(zip(headers, row))
         timestamp = row_dict.get("timestamp", "")
         snapshot_date = parse_wayback_timestamp(timestamp)
+
+        # Filter out snapshots after cutoff_date (extra safety)
+        if cutoff_dt:
+            try:
+                snapshot_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
+                if snapshot_dt > cutoff_dt:
+                    continue
+            except ValueError:
+                pass
+
         archive_url = f"{WAYBACK_BASE_URL}/{timestamp}/{row_dict.get('original', matched_url)}"
 
         snapshots.append({
@@ -308,7 +350,7 @@ async def list_available_snapshots(
         "total_found": len(snapshots),
         "date_range": {
             "start": start_date,
-            "end": end_date,
+            "end": effective_end_date,
         },
         "snapshots": snapshots,
     }
