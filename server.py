@@ -122,11 +122,132 @@ def parse_wayback_timestamp(timestamp: str) -> str:
     return timestamp
 
 
-def get_url_variations(url: str) -> list[str]:
-    """Generate URL variations to try (e.g., with .html, trailing slash)."""
+def extract_domain(url: str) -> str:
+    """Extract domain from URL."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return parsed.netloc or parsed.path.split("/")[0]
+
+
+async def get_domain_diagnostics(
+    client: httpx.AsyncClient,
+    url: str,
+    cutoff_date: str | None = None
+) -> dict:
+    """Check if domain has any captures and suggest alternatives."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    path = parsed.path
+
+    # Build date filter
+    date_params = {}
+    if cutoff_date:
+        date_params["to"] = cutoff_date.replace("-", "")
+
+    diagnostics = {
+        "domain": domain,
+        "path": path,
+        "domain_has_captures": False,
+        "sample_archived_paths": [],
+        "hints": [],
+        "reason": "unknown",
+    }
+
+    # Check domain-wide captures (limit to paths within cutoff)
+    params = {
+        "url": f"{domain}/*",
+        "output": "json",
+        "fl": "original,timestamp",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "limit": 50,
+        **date_params,
+    }
+
+    try:
+        resp = await client.get(WAYBACK_CDX_API, params=params, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if len(data) > 1:
+                diagnostics["domain_has_captures"] = True
+                headers = data[0]
+
+                # Extract unique paths
+                seen_paths = set()
+                for row in data[1:]:
+                    row_dict = dict(zip(headers, row))
+                    original = row_dict.get("original", "")
+                    timestamp = row_dict.get("timestamp", "")
+
+                    # Filter by cutoff date
+                    if cutoff_date:
+                        snapshot_date = parse_wayback_timestamp(timestamp)
+                        if snapshot_date > cutoff_date:
+                            continue
+
+                    # Extract path from URL
+                    try:
+                        orig_parsed = urlparse(original)
+                        orig_path = orig_parsed.path or "/"
+                        if orig_path not in seen_paths and len(seen_paths) < 10:
+                            seen_paths.add(orig_path)
+                            diagnostics["sample_archived_paths"].append(orig_path)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # Determine reason and hints
+    if not diagnostics["domain_has_captures"]:
+        diagnostics["reason"] = "domain_not_archived"
+        diagnostics["hints"].append(f"The domain '{domain}' has no captures in the Wayback Machine (or none before the cutoff date).")
+        # Check www variant
+        if domain.startswith("www."):
+            alt = domain[4:]
+        else:
+            alt = "www." + domain
+        diagnostics["hints"].append(f"Try the alternate host: {alt}")
+    else:
+        diagnostics["reason"] = "path_not_archived"
+        diagnostics["hints"].append(f"The specific path '{path}' is not archived, but the domain has captures.")
+
+        # Suggest similar paths
+        if path and path != "/":
+            path_keywords = [p for p in path.strip("/").split("/") if p]
+            matching_paths = [
+                p for p in diagnostics["sample_archived_paths"]
+                if any(kw.lower() in p.lower() for kw in path_keywords)
+            ]
+            if matching_paths:
+                diagnostics["hints"].append(f"Similar archived paths found: {', '.join(matching_paths[:5])}")
+            else:
+                diagnostics["hints"].append(f"Try one of these archived paths: {', '.join(diagnostics['sample_archived_paths'][:5])}")
+
+    return diagnostics
+
+
+def get_url_variations(url: str, include_host_variants: bool = True) -> list[str]:
+    """Generate URL variations to try (e.g., with .html, trailing slash, www/non-www)."""
+    from urllib.parse import urlparse, urlunparse
+
     variations = [url]
 
-    # Don't add variations if URL already has a file extension or query string
+    # Add www/non-www variant
+    if include_host_variants:
+        parsed = urlparse(url)
+        host = parsed.netloc
+        if host.startswith("www."):
+            alt_host = host[4:]
+        else:
+            alt_host = "www." + host
+        alt_parsed = parsed._replace(netloc=alt_host)
+        alt_url = urlunparse(alt_parsed)
+        if alt_url != url:
+            variations.append(alt_url)
+
+    # Don't add path variations if URL already has a file extension or query string
     if "?" in url or url.endswith("/"):
         return variations
 
@@ -135,12 +256,13 @@ def get_url_variations(url: str) -> list[str]:
     if path.endswith((".html", ".htm", ".php", ".asp", ".aspx", ".jsp")):
         return variations
 
-    # Add common variations
-    variations.extend([
-        url + ".html",
-        url + ".htm",
-        url + "/",
-    ])
+    # Add common path variations for each host variant
+    base_variations = list(variations)
+    for base_url in base_variations:
+        for suffix in [".html", ".htm", "/"]:
+            variant = base_url + suffix
+            if variant not in variations:
+                variations.append(variant)
 
     return variations
 
@@ -206,8 +328,25 @@ async def get_archived_snapshot(
                 break
 
         if not snapshot:
+            # Get diagnostics to provide helpful hints
+            diagnostics = await get_domain_diagnostics(client, url, cutoff_date=target_date)
             tried = ", ".join(url_variations)
-            return f"No archived snapshot found for '{url}' at or before {target_date}. Tried URL variations: {tried}. The page may not be archived in the Wayback Machine."
+
+            result = f"No archived snapshot found for '{url}' at or before {target_date}.\n\n"
+            result += f"**Tried URL variations:** {tried}\n\n"
+            result += f"**Reason:** {diagnostics['reason'].replace('_', ' ').title()}\n\n"
+
+            if diagnostics["hints"]:
+                result += "**Hints:**\n"
+                for hint in diagnostics["hints"]:
+                    result += f"- {hint}\n"
+
+            if diagnostics["sample_archived_paths"]:
+                result += f"\n**Archived paths on this domain (before {target_date}):**\n"
+                for path in diagnostics["sample_archived_paths"][:8]:
+                    result += f"- {path}\n"
+
+            return result
 
         snapshot_timestamp = snapshot.get("timestamp", "")
         snapshot_date = parse_wayback_timestamp(snapshot_timestamp)
@@ -231,6 +370,56 @@ async def get_archived_snapshot(
     return result
 
 
+def apply_pick_filter(snapshots: list[dict], pick: str, target_date: str | None = None) -> list[dict]:
+    """Apply snapshot selection filter based on pick parameter."""
+    if not snapshots or not pick:
+        return snapshots
+
+    if pick == "closest_to_end":
+        # Return single snapshot closest to end of range (most recent)
+        return snapshots[:1] if snapshots else []
+
+    elif pick == "closest_to_start":
+        # Return single snapshot closest to start of range (oldest)
+        return snapshots[-1:] if snapshots else []
+
+    elif pick == "closest_to_date" and target_date:
+        # Return single snapshot closest to specified date
+        try:
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d")
+            closest = min(
+                snapshots,
+                key=lambda s: abs((datetime.strptime(s["date"], "%Y-%m-%d") - target_dt).days)
+            )
+            return [closest]
+        except (ValueError, KeyError):
+            return snapshots[:1]
+
+    elif pick == "monthly":
+        # Return one snapshot per month
+        seen_months = set()
+        monthly = []
+        for s in snapshots:
+            month_key = s["date"][:7]  # YYYY-MM
+            if month_key not in seen_months:
+                seen_months.add(month_key)
+                monthly.append(s)
+        return monthly
+
+    elif pick == "yearly":
+        # Return one snapshot per year
+        seen_years = set()
+        yearly = []
+        for s in snapshots:
+            year_key = s["date"][:4]  # YYYY
+            if year_key not in seen_years:
+                seen_years.add(year_key)
+                yearly.append(s)
+        return yearly
+
+    return snapshots
+
+
 @mcp.tool(
     name="list_available_snapshots",
     title="List Available Snapshots",
@@ -247,6 +436,9 @@ Workflow:
 Examples:
 - To find all snapshots of a page in 2024: list_available_snapshots(url="example.com", start_date="2024-01-01", end_date="2024-12-31")
 - To check recent archive coverage: list_available_snapshots(url="company.com/team", limit=5)
+- To get snapshots for multiple years at once: list_available_snapshots(url="example.com", years=[2022, 2023, 2024])
+- To get one snapshot per year: list_available_snapshots(url="example.com", pick="yearly")
+- To get the snapshot closest to year-end: list_available_snapshots(url="example.com", pick="closest_to_date", target_date="2024-12-31")
 
 Returns a list of available snapshot dates with their archive URLs.""",
     tags={"backtesting_supported", "output:medium", "format:json"},
@@ -259,12 +451,125 @@ async def list_available_snapshots(
     url: Annotated[str, "The URL to check for snapshots (e.g., 'example.com' or 'https://example.com/page')"],
     start_date: Annotated[str | None, "Start of date range in YYYY-MM-DD format (optional)"] = None,
     end_date: Annotated[str | None, "End of date range in YYYY-MM-DD format (optional)"] = None,
+    years: Annotated[list[int] | None, "List of years to query (e.g., [2022, 2023, 2024]). Overrides start_date/end_date."] = None,
+    pick: Annotated[str | None, "Snapshot selection: 'closest_to_end', 'closest_to_start', 'closest_to_date', 'monthly', 'yearly'"] = None,
+    target_date: Annotated[str | None, "Target date for 'closest_to_date' pick option (YYYY-MM-DD)"] = None,
     limit: Annotated[int, "Maximum number of snapshots to return (default 20, max 50)"] = 20,
     cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
 ) -> str:
     # Validate and cap limit
     limit = min(max(1, limit), 50)
 
+    # Parse cutoff date
+    cutoff_dt = None
+    if cutoff_date:
+        try:
+            cutoff_dt = datetime.strptime(cutoff_date, "%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # If years provided, query each year separately
+    if years:
+        all_snapshots = []
+        years_queried = []
+
+        # Filter years to only include those before cutoff
+        for year in sorted(set(years)):
+            if cutoff_dt and year > cutoff_dt.year:
+                continue
+            years_queried.append(year)
+
+        # Normalize URL
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        url_variations = get_url_variations(url)
+        matched_url = url
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            for year in years_queried:
+                year_start = f"{year}-01-01"
+                year_end = f"{year}-12-31"
+
+                # Cap year_end at cutoff_date
+                if cutoff_dt and year == cutoff_dt.year:
+                    year_end = cutoff_date
+
+                for url_variant in url_variations:
+                    params = {
+                        "url": url_variant,
+                        "output": "json",
+                        "fl": "timestamp,original,statuscode",
+                        "filter": "statuscode:200",
+                        "collapse": "timestamp:8",
+                        "limit": 20,
+                        "sort": "reverse",
+                        "from": year_start.replace("-", ""),
+                        "to": year_end.replace("-", ""),
+                    }
+
+                    try:
+                        resp = await client.get(WAYBACK_CDX_API, params=params)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if len(data) > 1:
+                            matched_url = url_variant
+                            headers = data[0]
+                            for row in data[1:]:
+                                row_dict = dict(zip(headers, row))
+                                timestamp = row_dict.get("timestamp", "")
+                                snapshot_date = parse_wayback_timestamp(timestamp)
+
+                                # Extra safety: filter by cutoff
+                                if cutoff_dt:
+                                    try:
+                                        snap_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
+                                        if snap_dt > cutoff_dt:
+                                            continue
+                                    except ValueError:
+                                        pass
+
+                                archive_url = f"{WAYBACK_BASE_URL}/{timestamp}/{row_dict.get('original', matched_url)}"
+                                all_snapshots.append({
+                                    "date": snapshot_date,
+                                    "timestamp": timestamp,
+                                    "archive_url": archive_url,
+                                    "year": year,
+                                })
+                            break
+                    except Exception:
+                        continue
+
+            if not all_snapshots:
+                diagnostics = await get_domain_diagnostics(client, url, cutoff_date=cutoff_date)
+                return json.dumps({
+                    "url": url,
+                    "years_queried": years_queried,
+                    "snapshots": [],
+                    "diagnostics": diagnostics,
+                }, indent=2)
+
+        # Apply pick filter
+        all_snapshots = apply_pick_filter(all_snapshots, pick, target_date)
+
+        # Group by year for output
+        by_year = {}
+        for s in all_snapshots:
+            yr = s.get("year", s["date"][:4])
+            if yr not in by_year:
+                by_year[yr] = []
+            by_year[yr].append(s)
+
+        return json.dumps({
+            "url": url,
+            "matched_url": matched_url,
+            "years_queried": years_queried,
+            "total_found": len(all_snapshots),
+            "snapshots_by_year": by_year,
+            "snapshots": all_snapshots[:limit],
+        }, indent=2)
+
+    # Standard single-range query
     # For backtesting: cap end_date at cutoff_date to prevent leakage
     effective_end_date = end_date
     if cutoff_date:
@@ -272,6 +577,11 @@ async def list_available_snapshots(
             effective_end_date = cutoff_date
         else:
             effective_end_date = min(end_date, cutoff_date)
+
+    # Cap target_date at cutoff_date for closest_to_date
+    effective_target_date = target_date
+    if target_date and cutoff_date and target_date > cutoff_date:
+        effective_target_date = cutoff_date
 
     # Normalize URL
     if not url.startswith(("http://", "https://")):
@@ -310,28 +620,20 @@ async def list_available_snapshots(
             except json.JSONDecodeError:
                 continue
 
-    if not data or len(data) <= 1:
-        tried = ", ".join(url_variations)
-        return json.dumps({
-            "url": url,
-            "tried_variations": url_variations,
-            "snapshots": [],
-            "message": f"No archived snapshots found. Tried: {tried}" +
-                      (f" between {start_date} and {end_date}" if start_date or end_date else "")
-        }, indent=2)
+        if not data or len(data) <= 1:
+            # Get diagnostics for helpful error message
+            diagnostics = await get_domain_diagnostics(client, url, cutoff_date=effective_end_date)
+            return json.dumps({
+                "url": url,
+                "tried_variations": url_variations,
+                "snapshots": [],
+                "diagnostics": diagnostics,
+            }, indent=2)
 
     headers = data[0]
     snapshots = []
 
-    # Parse cutoff for filtering
-    cutoff_dt = None
-    if cutoff_date:
-        try:
-            cutoff_dt = datetime.strptime(cutoff_date, "%Y-%m-%d")
-        except ValueError:
-            pass
-
-    for row in data[1:limit + 1]:
+    for row in data[1:limit * 2]:
         row_dict = dict(zip(headers, row))
         timestamp = row_dict.get("timestamp", "")
         snapshot_date = parse_wayback_timestamp(timestamp)
@@ -353,6 +655,12 @@ async def list_available_snapshots(
             "archive_url": archive_url,
         })
 
+    # Apply pick filter
+    snapshots = apply_pick_filter(snapshots, pick, effective_target_date)
+
+    # Limit final output
+    snapshots = snapshots[:limit]
+
     result = {
         "url": url,
         "matched_url": matched_url,
@@ -363,6 +671,176 @@ async def list_available_snapshots(
         },
         "snapshots": snapshots,
     }
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    name="search_site_archives",
+    title="Search Site Archives",
+    description="""Search for archived pages on a domain that match a path pattern.
+
+Use this tool when:
+- The target URL has no captures but you want to find related pages on the same domain
+- You're looking for a page but don't know the exact path (e.g., "team" page could be /team, /about-us, /people)
+- You want to discover what pages exist on a domain in the archive
+
+Examples:
+- Find team pages: search_site_archives(domain="example.com", path_pattern="*team*")
+- Find about pages: search_site_archives(domain="nonprofit.org", path_pattern="*about*")
+- List all archived pages: search_site_archives(domain="startup.io")
+
+Returns a list of unique archived paths on the domain with their most recent snapshot dates.""",
+    tags={"backtesting_supported", "output:medium", "format:json"},
+    exclude_args=["cutoff_date"],
+    meta={"when_to_use": "Use when a specific URL has no captures but you want to find similar pages on the domain, or to discover what pages exist in the archive."},
+)
+@rate_limited(_limiter)
+@notify_on_error
+async def search_site_archives(
+    domain: Annotated[str, "Domain to search (e.g., 'example.com' or 'www.example.com')"],
+    path_pattern: Annotated[str | None, "Path pattern to match using wildcards (e.g., '*team*', '*about*', '/blog/*')"] = None,
+    limit: Annotated[int, "Maximum number of unique paths to return (default 30, max 100)"] = 30,
+    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
+) -> str:
+    from urllib.parse import urlparse
+
+    # Validate and cap limit
+    limit = min(max(1, limit), 100)
+
+    # Parse cutoff date
+    cutoff_dt = None
+    if cutoff_date:
+        try:
+            cutoff_dt = datetime.strptime(cutoff_date, "%Y-%m-%d")
+        except ValueError:
+            pass
+
+    # Clean domain (remove protocol if present)
+    if domain.startswith(("http://", "https://")):
+        parsed = urlparse(domain)
+        domain = parsed.netloc
+
+    # Build search URL pattern
+    if path_pattern:
+        # Ensure pattern has wildcard if not already
+        if not path_pattern.startswith(("*", "/")):
+            path_pattern = "*" + path_pattern
+        if not path_pattern.endswith("*"):
+            path_pattern = path_pattern + "*"
+        search_url = f"{domain}{path_pattern}"
+    else:
+        search_url = f"{domain}/*"
+
+    # Try both www and non-www variants
+    domains_to_try = [domain]
+    if domain.startswith("www."):
+        domains_to_try.append(domain[4:])
+    else:
+        domains_to_try.append("www." + domain)
+
+    all_results = []
+    seen_paths = set()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for d in domains_to_try:
+            if path_pattern:
+                pattern = path_pattern if path_pattern.startswith("/") else path_pattern
+                query_url = f"{d}{pattern}" if pattern.startswith("/") else f"{d}/*{pattern}*"
+            else:
+                query_url = f"{d}/*"
+
+            params = {
+                "url": query_url,
+                "output": "json",
+                "fl": "original,timestamp,statuscode",
+                "filter": "statuscode:200",
+                "collapse": "urlkey",  # One result per unique URL
+                "limit": limit * 3,  # Get extra to account for filtering
+            }
+
+            # Add date filter for cutoff
+            if cutoff_date:
+                params["to"] = cutoff_date.replace("-", "")
+
+            try:
+                resp = await client.get(WAYBACK_CDX_API, params=params, timeout=20)
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                if len(data) <= 1:
+                    continue
+
+                headers = data[0]
+                for row in data[1:]:
+                    row_dict = dict(zip(headers, row))
+                    original = row_dict.get("original", "")
+                    timestamp = row_dict.get("timestamp", "")
+                    snapshot_date = parse_wayback_timestamp(timestamp)
+
+                    # Extra safety: filter by cutoff date
+                    if cutoff_dt:
+                        try:
+                            snap_dt = datetime.strptime(snapshot_date, "%Y-%m-%d")
+                            if snap_dt > cutoff_dt:
+                                continue
+                        except ValueError:
+                            pass
+
+                    # Extract path
+                    try:
+                        orig_parsed = urlparse(original)
+                        path = orig_parsed.path or "/"
+                        host = orig_parsed.netloc
+
+                        # Deduplicate by path (ignore host variations)
+                        path_key = path.lower().rstrip("/") or "/"
+                        if path_key in seen_paths:
+                            continue
+                        seen_paths.add(path_key)
+
+                        archive_url = f"{WAYBACK_BASE_URL}/{timestamp}/{original}"
+                        all_results.append({
+                            "path": path,
+                            "full_url": original,
+                            "host": host,
+                            "last_captured": snapshot_date,
+                            "archive_url": archive_url,
+                        })
+
+                        if len(all_results) >= limit:
+                            break
+                    except Exception:
+                        continue
+
+                if len(all_results) >= limit:
+                    break
+
+            except Exception:
+                continue
+
+    # Sort by path for easier reading
+    all_results.sort(key=lambda x: x["path"])
+
+    result = {
+        "domain": domain,
+        "domains_searched": domains_to_try,
+        "path_pattern": path_pattern,
+        "cutoff_date": cutoff_date,
+        "total_found": len(all_results),
+        "paths": all_results[:limit],
+    }
+
+    if not all_results:
+        result["message"] = f"No archived pages found for domain '{domain}'" + (
+            f" matching pattern '{path_pattern}'" if path_pattern else ""
+        ) + f" before {cutoff_date}."
+        result["hints"] = [
+            "Try a different domain variant (www vs non-www)",
+            "Try a broader path pattern",
+            "The site may not be well-archived in the Wayback Machine",
+        ]
 
     return json.dumps(result, indent=2)
 

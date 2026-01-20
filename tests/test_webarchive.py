@@ -2,46 +2,42 @@ import inspect
 
 import pytest
 
-from server import get_archived_snapshot, list_available_snapshots, mcp, parse_wayback_timestamp
+from server import (
+    get_archived_snapshot,
+    list_available_snapshots,
+    search_site_archives,
+    mcp,
+    parse_wayback_timestamp,
+    get_url_variations,
+    apply_pick_filter,
+)
 
 
 class TestBacktestToolConfiguration:
-    """Tests for backtesting tool configuration."""
+    """Tests for backtesting tool configuration - ALL tools should support backtesting."""
 
-    def test_backtest_tool_has_backtesting_supported_tag(self):
-        tool = get_archived_snapshot
+    @pytest.mark.parametrize("tool", [get_archived_snapshot, list_available_snapshots, search_site_archives])
+    def test_backtest_tool_has_backtesting_supported_tag(self, tool):
         tags = getattr(tool, "tags", set()) or set()
-        assert "backtesting_supported" in tags, f"Missing 'backtesting_supported' tag. Found: {tags}"
+        assert "backtesting_supported" in tags, f"Missing 'backtesting_supported' tag for {tool.name}. Found: {tags}"
 
-    def test_backtest_tool_has_cutoff_date_parameter(self):
-        sig = inspect.signature(get_archived_snapshot.fn)
+    @pytest.mark.parametrize("tool", [get_archived_snapshot, list_available_snapshots, search_site_archives])
+    def test_backtest_tool_has_cutoff_date_parameter(self, tool):
+        sig = inspect.signature(tool.fn)
         params = list(sig.parameters.keys())
-        assert "cutoff_date" in params, f"Missing 'cutoff_date' parameter. Found: {params}"
+        assert "cutoff_date" in params, f"Missing 'cutoff_date' parameter for {tool.name}. Found: {params}"
 
-    def test_backtest_tool_cutoff_date_excluded_from_schema(self):
-        tool = get_archived_snapshot
+    @pytest.mark.parametrize("tool", [get_archived_snapshot, list_available_snapshots, search_site_archives])
+    def test_backtest_tool_cutoff_date_excluded_from_schema(self, tool):
         schema_params = tool.parameters.get("properties", {}).keys()
-        assert "cutoff_date" not in schema_params, f"'cutoff_date' should be excluded from schema. Found: {list(schema_params)}"
+        assert "cutoff_date" not in schema_params, f"'cutoff_date' should be excluded from schema for {tool.name}. Found: {list(schema_params)}"
 
-    def test_backtest_tool_cutoff_date_has_default(self):
-        sig = inspect.signature(get_archived_snapshot.fn)
+    @pytest.mark.parametrize("tool", [get_archived_snapshot, list_available_snapshots, search_site_archives])
+    def test_backtest_tool_cutoff_date_has_default(self, tool):
+        sig = inspect.signature(tool.fn)
         cutoff_param = sig.parameters.get("cutoff_date")
-        assert cutoff_param is not None, "cutoff_date parameter not found"
-        assert cutoff_param.default != inspect.Parameter.empty, "cutoff_date should have default value"
-
-
-class TestNonBacktestToolConfiguration:
-    """Tests for non-backtesting tool configuration."""
-
-    def test_list_snapshots_does_not_have_backtesting_supported_tag(self):
-        tool = list_available_snapshots
-        tags = getattr(tool, "tags", set()) or set()
-        assert "backtesting_supported" not in tags, f"Should not have 'backtesting_supported' tag. Found: {tags}"
-
-    def test_list_snapshots_does_not_have_cutoff_date_parameter(self):
-        sig = inspect.signature(list_available_snapshots.fn)
-        params = list(sig.parameters.keys())
-        assert "cutoff_date" not in params, f"Should not have 'cutoff_date' parameter. Found: {params}"
+        assert cutoff_param is not None, f"cutoff_date parameter not found for {tool.name}"
+        assert cutoff_param.default != inspect.Parameter.empty, f"cutoff_date should have default value for {tool.name}"
 
 
 class TestAllToolsBacktestingConsistency:
@@ -91,6 +87,84 @@ class TestHelperFunctions:
         result = parse_wayback_timestamp("2024")
         assert result == "2024"  # Returns as-is if too short
 
+    def test_get_url_variations_includes_www(self):
+        variations = get_url_variations("https://example.com/page")
+        assert "https://www.example.com/page" in variations
+
+    def test_get_url_variations_removes_www(self):
+        variations = get_url_variations("https://www.example.com/page")
+        assert "https://example.com/page" in variations
+
+    def test_get_url_variations_adds_extensions(self):
+        variations = get_url_variations("https://example.com/page")
+        assert "https://example.com/page.html" in variations
+        assert "https://example.com/page.htm" in variations
+        assert "https://example.com/page/" in variations
+
+    def test_get_url_variations_no_extension_for_existing(self):
+        variations = get_url_variations("https://example.com/page.html")
+        # Should not add .html again
+        assert "https://example.com/page.html.html" not in variations
+
+    def test_apply_pick_filter_closest_to_end(self):
+        snapshots = [
+            {"date": "2024-03-01"},
+            {"date": "2024-02-01"},
+            {"date": "2024-01-01"},
+        ]
+        result = apply_pick_filter(snapshots, "closest_to_end")
+        assert len(result) == 1
+        assert result[0]["date"] == "2024-03-01"
+
+    def test_apply_pick_filter_closest_to_start(self):
+        snapshots = [
+            {"date": "2024-03-01"},
+            {"date": "2024-02-01"},
+            {"date": "2024-01-01"},
+        ]
+        result = apply_pick_filter(snapshots, "closest_to_start")
+        assert len(result) == 1
+        assert result[0]["date"] == "2024-01-01"
+
+    def test_apply_pick_filter_monthly(self):
+        snapshots = [
+            {"date": "2024-03-15"},
+            {"date": "2024-03-01"},
+            {"date": "2024-02-15"},
+            {"date": "2024-02-01"},
+            {"date": "2024-01-15"},
+        ]
+        result = apply_pick_filter(snapshots, "monthly")
+        assert len(result) == 3
+        months = [s["date"][:7] for s in result]
+        assert "2024-03" in months
+        assert "2024-02" in months
+        assert "2024-01" in months
+
+    def test_apply_pick_filter_yearly(self):
+        snapshots = [
+            {"date": "2024-06-15"},
+            {"date": "2024-01-15"},
+            {"date": "2023-06-15"},
+            {"date": "2022-06-15"},
+        ]
+        result = apply_pick_filter(snapshots, "yearly")
+        assert len(result) == 3
+        years = [s["date"][:4] for s in result]
+        assert "2024" in years
+        assert "2023" in years
+        assert "2022" in years
+
+    def test_apply_pick_filter_closest_to_date(self):
+        snapshots = [
+            {"date": "2024-03-01"},
+            {"date": "2024-02-01"},
+            {"date": "2024-01-01"},
+        ]
+        result = apply_pick_filter(snapshots, "closest_to_date", "2024-02-15")
+        assert len(result) == 1
+        assert result[0]["date"] == "2024-02-01"
+
 
 class TestToolSchemas:
     """Tests for tool schemas."""
@@ -114,4 +188,16 @@ class TestToolSchemas:
         assert "url" in required, "'url' should be required"
         assert "start_date" in props, "Missing 'start_date' parameter"
         assert "end_date" in props, "Missing 'end_date' parameter"
+        assert "limit" in props, "Missing 'limit' parameter"
+        assert "years" in props, "Missing 'years' parameter"
+        assert "pick" in props, "Missing 'pick' parameter"
+
+    def test_search_site_archives_has_required_params(self):
+        tool = search_site_archives
+        props = tool.parameters.get("properties", {})
+        required = tool.parameters.get("required", [])
+
+        assert "domain" in props, "Missing 'domain' parameter"
+        assert "domain" in required, "'domain' should be required"
+        assert "path_pattern" in props, "Missing 'path_pattern' parameter"
         assert "limit" in props, "Missing 'limit' parameter"
