@@ -24,6 +24,21 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Create .env from secrets
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+        run: |
+          python3 -c "
+          import json, os
+          secrets = json.loads(os.environ['ALL_SECRETS'])
+          with open('.env', 'w') as f:
+              for k, v in secrets.items():
+                  if k.startswith('GITHUB_'):
+                      continue
+                  f.write(f'{k}={v}\n')
+          print(f'Wrote {len(secrets)} env vars to .env')
+          "
+
       - name: Verify server loads
         run: |
           uv run python -c "
@@ -38,10 +53,6 @@ jobs:
 
       - name: Run tests
         run: uv run pytest tests/ -v
-        env:
-          # Add API keys needed for live tests as repo secrets, then reference here:
-          # EXAMPLE_API_KEY: ${{ secrets.EXAMPLE_API_KEY }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
       - name: Notify failure via Slack
         if: failure()
@@ -82,23 +93,3 @@ jobs:
                 }
               ]
             }" || echo "Slack notification failed"
-
-      - name: Notify failure via email
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "CI Failed: ${{ github.repository }} (${{ github.sha }})"
-          to: ${{ secrets.NOTIFY_EMAIL }}
-          from: ${{ secrets.SMTP_FROM || 'ci@chestnutforty.com' }}
-          body: |
-            CI failed for ${{ github.repository }}
-
-            Commit: ${{ github.sha }}
-            Pushed by: ${{ github.actor }}
-            Branch: ${{ github.ref_name }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        continue-on-error: true  # Don't fail the whole run if email secrets aren't configured
