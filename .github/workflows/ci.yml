@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Verify server loads
+        run: |
+          uv run python -c "
+          from server import mcp
+          tools = mcp._tool_manager._tools
+          print(f'Server: {mcp.name}')
+          print(f'Tools registered: {len(tools)}')
+          for name in tools:
+              print(f'  - {name}')
+          assert len(tools) > 0, 'No tools registered — server.py is broken'
+          "
+
+      - name: Run tests
+        run: uv run pytest tests/ -v
+        env:
+          # Add API keys needed for live tests as repo secrets, then reference here:
+          # EXAMPLE_API_KEY: ${{ secrets.EXAMPLE_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify failure via Slack
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL set, skipping notification"
+            exit 0
+          fi
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          COMMIT="${{ github.sha }}"
+          SHORT_SHA="${COMMIT:0:7}"
+          PUSHER="${{ github.actor }}"
+          curl -sf "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \"CI failed for ${REPO}\",
+              \"blocks\": [
+                {
+                  \"type\": \"header\",
+                  \"text\": {\"type\": \"plain_text\", \"text\": \"CI Failed\"}
+                },
+                {
+                  \"type\": \"section\",
+                  \"fields\": [
+                    {\"type\": \"mrkdwn\", \"text\": \"*Repo:*\n${REPO}\"},
+                    {\"type\": \"mrkdwn\", \"text\": \"*Commit:*\n${SHORT_SHA}\"}
+                  ]
+                },
+                {
+                  \"type\": \"section\",
+                  \"fields\": [
+                    {\"type\": \"mrkdwn\", \"text\": \"*Pushed by:*\n${PUSHER}\"},
+                    {\"type\": \"mrkdwn\", \"text\": \"*Run:*\n<${RUN_URL}|View logs>\"}
+                  ]
+                }
+              ]
+            }" || echo "Slack notification failed"
+
+      - name: Notify failure via email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "CI Failed: ${{ github.repository }} (${{ github.sha }})"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: ${{ secrets.SMTP_FROM || 'ci@chestnutforty.com' }}
+          body: |
+            CI failed for ${{ github.repository }}
+
+            Commit: ${{ github.sha }}
+            Pushed by: ${{ github.actor }}
+            Branch: ${{ github.ref_name }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true  # Don't fail the whole run if email secrets aren't configured
