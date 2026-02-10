@@ -1,3 +1,10 @@
+"""MCP server for Internet Archive Wayback Machine.
+
+Access historical webpage snapshots from the Internet Archive Wayback Machine.
+Useful for retrieving historical content, verifying past information, and tracking
+changes to websites over time.
+"""
+
 import json
 import os
 import traceback
@@ -15,6 +22,7 @@ from fastmcp import FastMCP
 
 from rate_limiter import RateLimiter, rate_limited
 
+# Slack webhook for error notifications
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 MCP_NAME = "webarchive"
 
@@ -22,26 +30,67 @@ WAYBACK_CDX_API = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE_URL = "https://web.archive.org/web"
 
 
-def send_slack_error(tool_name: str, error: Exception, args: tuple, kwargs: dict) -> None:
+def send_slack_error(
+    tool_name: str, error: Exception, args: tuple, kwargs: dict
+) -> None:
+    """Send error notification to Slack webhook."""
     try:
         error_message = {
             "text": f"MCP Tool Error in `{MCP_NAME}`",
             "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": "MCP Tool Error", "emoji": True}},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*MCP Server:*\n{MCP_NAME}"},
-                    {"type": "mrkdwn", "text": f"*Tool:*\n{tool_name}"},
-                ]},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Error:*\n```{str(error)[:500]}```"}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Traceback:*\n```{traceback.format_exc()[:1000]}```"}},
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "MCP Tool Error",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*MCP Server:*\n{MCP_NAME}"},
+                        {"type": "mrkdwn", "text": f"*Tool:*\n{tool_name}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Args:*\n```{str(args)[:200]}```",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Kwargs:*\n```{str(kwargs)[:300]}```",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Error:*\n```{str(error)[:500]}```",
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Traceback:*\n```{traceback.format_exc()[:1000]}```",
+                    },
+                },
             ],
         }
         httpx.post(SLACK_WEBHOOK_URL, json=error_message, timeout=5)
     except Exception:
-        pass
+        pass  # Don't let Slack errors affect the tool response
 
 
 def notify_on_error(func):
+    """Decorator to send Slack notification on tool errors."""
+
     @wraps(func)
     async def wrapper(*args, **kwargs):
         try:
@@ -52,6 +101,21 @@ def notify_on_error(func):
     return wrapper
 
 
+# Proxy support - ONLY for APIs with NO authentication
+# APIs with API keys track usage per key, so proxy is unnecessary
+# APIs without auth rate-limit by IP, so proxy helps avoid limits
+def _build_proxy_url() -> str | None:
+    """Build Oxylabs proxy URL from credentials."""
+    username = os.getenv("OXYLABS_USERNAME")
+    password = os.getenv("OXYLABS_PASSWORD")
+    if not username or not password:
+        return None
+    return f"http://{username}:{password}@pr.oxylabs.io:7777"
+
+
+PROXY_URL = _build_proxy_url()
+
+# Rate limiter instance
 _limiter = RateLimiter()
 
 mcp = FastMCP(
@@ -267,26 +331,38 @@ def get_url_variations(url: str, include_host_variants: bool = True) -> list[str
     return variations
 
 
+# =============================================================================
+# TOOLS
+# =============================================================================
+
+
 @mcp.tool(
-    name="get_archived_snapshot",
+    name="webarchive_get_snapshot",
     title="Get Archived Snapshot",
     description="""Fetch the content of a webpage from the Internet Archive Wayback Machine at or before a specified date.
 
-Use this tool when you need to see how a webpage looked at a specific point in the past. The tool will find
-the closest available snapshot before or on the target date and return its content as readable text.
+Finds the closest available snapshot before or on the target date and returns its content as readable text.
+Automatically tries www/non-www variants and common extensions (.html, .htm, /).
 
-Tip: If unsure whether a page is archived, first use list_available_snapshots to see available dates,
+Tip: If unsure whether a page is archived, first use webarchive_list_snapshots to see available dates,
 then call this tool with a date from those results.
-
-Examples:
-- To check a company's team page from 6 months ago: get_archived_snapshot(url="example.com/team", target_date="2024-06-01")
-- To verify historical product pricing: get_archived_snapshot(url="store.com/pricing", target_date="2023-01-15")
-- To see an organization's past mission statement: get_archived_snapshot(url="nonprofit.org/about", target_date="2022-12-01")
 
 Note: Not all pages are archived, and archive frequency varies. The tool returns the closest available snapshot.""",
     tags={"backtesting_supported", "output:high", "format:text"},
     exclude_args=["cutoff_date"],
-    meta={"when_to_use": "Use when you need historical webpage content for forecasting questions about organization changes, website history, or verifying past information."},
+    meta={
+        "when_to_use": """Use when forecasting questions require verifying historical webpage content.
+
+Forecast: "Will company X change its leadership by Q2 2025?"
+-> webarchive_get_snapshot(url="company.com/team", target_date="2024-12-01") to check current team composition
+
+Forecast: "Will organization Y update its policy on Z?"
+-> webarchive_get_snapshot(url="org.com/policy", target_date="2024-06-01") to see past policy text
+
+Forecast: "Has product pricing changed over the past year?"
+-> webarchive_get_snapshot(url="store.com/pricing", target_date="2023-01-15") to verify historical pricing
+"""
+    },
 )
 @rate_limited(_limiter)
 @notify_on_error
@@ -320,7 +396,7 @@ async def get_archived_snapshot(
     matched_url = url
 
     # Use single client for all operations to avoid connection pool exhaustion
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True, proxy=PROXY_URL) as client:
         for url_variant in url_variations:
             snapshot = await find_snapshot_before_date(client, url_variant, target_date)
             if snapshot:
@@ -421,29 +497,40 @@ def apply_pick_filter(snapshots: list[dict], pick: str, target_date: str | None 
 
 
 @mcp.tool(
-    name="list_available_snapshots",
+    name="webarchive_list_snapshots",
     title="List Available Snapshots",
     description="""List available snapshots for a URL within a date range from the Internet Archive Wayback Machine.
 
-Use this tool to discover what archived versions of a webpage exist before fetching specific content.
-This helps you identify which dates have captures available.
+Discover what archived versions of a webpage exist before fetching specific content.
 
 Workflow:
-1. Call list_available_snapshots to see what dates have archived versions
+1. Call webarchive_list_snapshots to see what dates have archived versions
 2. Pick a date from the results
-3. Call get_archived_snapshot with that date as target_date to fetch the content
+3. Call webarchive_get_snapshot with that date as target_date to fetch the content
 
-Examples:
-- To find all snapshots of a page in 2024: list_available_snapshots(url="example.com", start_date="2024-01-01", end_date="2024-12-31")
-- To check recent archive coverage: list_available_snapshots(url="company.com/team", limit=5)
-- To get snapshots for multiple years at once: list_available_snapshots(url="example.com", years=[2022, 2023, 2024])
-- To get one snapshot per year: list_available_snapshots(url="example.com", pick="yearly")
-- To get the snapshot closest to year-end: list_available_snapshots(url="example.com", pick="closest_to_date", target_date="2024-12-31")
+Supports multi-year queries via `years` parameter and snapshot selection via `pick`:
+- `closest_to_end`: Most recent snapshot in range
+- `closest_to_start`: Oldest snapshot in range
+- `closest_to_date`: Closest to a specific target_date
+- `monthly`: One snapshot per month
+- `yearly`: One snapshot per year
 
 Returns a list of available snapshot dates with their archive URLs.""",
     tags={"backtesting_supported", "output:medium", "format:json"},
     exclude_args=["cutoff_date"],
-    meta={"when_to_use": "Use to discover available archive dates before fetching specific snapshots, especially when unsure about archive coverage."},
+    meta={
+        "when_to_use": """Use to discover available archive dates before fetching specific snapshots.
+
+Forecast: "Has a website changed over the past 3 years?"
+-> webarchive_list_snapshots(url="example.com", years=[2022, 2023, 2024], pick="yearly")
+
+Forecast: "When did an organization last update its team page?"
+-> webarchive_list_snapshots(url="org.com/team", start_date="2024-01-01")
+
+Forecast: "Is a website still active / being maintained?"
+-> webarchive_list_snapshots(url="startup.io", limit=10) to check recent capture frequency
+"""
+    },
 )
 @rate_limited(_limiter)
 @notify_on_error
@@ -486,7 +573,7 @@ async def list_available_snapshots(
         url_variations = get_url_variations(url)
         matched_url = url
 
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
             for year in years_queried:
                 year_start = f"{year}-01-01"
                 year_end = f"{year}-12-31"
@@ -592,7 +679,7 @@ async def list_available_snapshots(
     data = None
     matched_url = url
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
         for url_variant in url_variations:
             params = {
                 "url": url_variant,
@@ -676,7 +763,7 @@ async def list_available_snapshots(
 
 
 @mcp.tool(
-    name="search_site_archives",
+    name="webarchive_search_site",
     title="Search Site Archives",
     description="""Search for archived pages on a domain that match a path pattern.
 
@@ -685,15 +772,25 @@ Use this tool when:
 - You're looking for a page but don't know the exact path (e.g., "team" page could be /team, /about-us, /people)
 - You want to discover what pages exist on a domain in the archive
 
-Examples:
-- Find team pages: search_site_archives(domain="example.com", path_pattern="*team*")
-- Find about pages: search_site_archives(domain="nonprofit.org", path_pattern="*about*")
-- List all archived pages: search_site_archives(domain="startup.io")
+Supports wildcard patterns (e.g., '*team*', '*about*', '/blog/*').
+Searches both www and non-www variants automatically.
 
 Returns a list of unique archived paths on the domain with their most recent snapshot dates.""",
     tags={"backtesting_supported", "output:medium", "format:json"},
     exclude_args=["cutoff_date"],
-    meta={"when_to_use": "Use when a specific URL has no captures but you want to find similar pages on the domain, or to discover what pages exist in the archive."},
+    meta={
+        "when_to_use": """Use when a specific URL has no captures or you need to discover pages on a domain.
+
+Forecast: "Will nonprofit X expand its programs?"
+-> webarchive_search_site(domain="nonprofit.org", path_pattern="*program*") to find program pages
+
+Forecast: "Does company Y have a public research page?"
+-> webarchive_search_site(domain="company.com", path_pattern="*research*")
+
+Forecast: "What sections does this organization's website have?"
+-> webarchive_search_site(domain="org.com") to list all archived pages
+"""
+    },
 )
 @rate_limited(_limiter)
 @notify_on_error
@@ -742,7 +839,7 @@ async def search_site_archives(
     all_results = []
     seen_paths = set()
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
         for d in domains_to_try:
             if path_pattern:
                 pattern = path_pattern if path_pattern.startswith("/") else path_pattern
