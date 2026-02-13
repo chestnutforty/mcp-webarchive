@@ -695,16 +695,16 @@ async def list_available_snapshots(
             if effective_end_date:
                 params["to"] = effective_end_date.replace("-", "")
 
-            resp = await client.get(WAYBACK_CDX_API, params=params)
-            resp.raise_for_status()
-
             try:
+                resp = await client.get(WAYBACK_CDX_API, params=params)
+                resp.raise_for_status()
+
                 variant_data = resp.json()
                 if len(variant_data) > 1:  # Has results (first row is header)
                     data = variant_data
                     matched_url = url_variant
                     break
-            except json.JSONDecodeError:
+            except (httpx.HTTPError, json.JSONDecodeError):
                 continue
 
         if not data or len(data) <= 1:
