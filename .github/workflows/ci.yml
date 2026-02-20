@@ -105,7 +105,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/chestnutforty/mcp-weather
+          images: ghcr.io/chestnutforty/mcp-webarchive
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-
