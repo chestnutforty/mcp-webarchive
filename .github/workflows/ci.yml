@@ -70,9 +70,10 @@ jobs:
         run: |
           JSON_SCHEMA='{"type":"object","properties":{"all_passed":{"type":"boolean"},"report":{"type":"string"}},"required":["all_passed","report"]}'
           timeout --signal=TERM --kill-after=30s 1200 \
-            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 100 --max-budget-usd 1 \
+            claude -p --dangerously-skip-permissions --model claude-haiku-4-5 --max-turns 100 --max-budget-usd 3 \
               --output-format json --json-schema "$JSON_SCHEMA" "
             Test the MCP server at http://localhost:8000/mcp. Be concise.
+            Do NOT attempt to fix the server or modify any code. Only test and report results.
 
             1. Read server.py to find all @mcp.tool definitions and which have cutoff_date params
             2. Write and run a Python script that:
@@ -82,26 +83,31 @@ jobs:
                - For tools with cutoff_date: picks a random date 1-5 months ago, calls with that cutoff_date, and checks response has no info from after that date
             3. Print summary: tool name, PASS/FAIL, reason for failures
 
+            If any tool fails or errors, report the failure as-is. Do not debug or retry.
             Set all_passed=true only if every tool passed. Put the full test report in report.
-            " > /tmp/claude-result.json 2>/tmp/claude-stderr.txt
+            " > /tmp/claude-result.json 2>/tmp/claude-stderr.txt || true
           echo "Raw output:"
-          cat /tmp/claude-result.json
+          cat /tmp/claude-result.json || true
+          if [ -f /tmp/claude-stderr.txt ] && [ -s /tmp/claude-stderr.txt ]; then
+            echo "Stderr:"
+            cat /tmp/claude-stderr.txt
+          fi
 
       - name: Check test results
         run: |
           if [ ! -s /tmp/claude-result.json ]; then
             echo "No output from Claude Code"
             [ -f /tmp/claude-stderr.txt ] && cat /tmp/claude-stderr.txt
+            echo "FAILED: No test output" > /tmp/claude-summary.txt
             exit 1
           fi
-          python3 -c "
+          python3 << 'PYEOF'
           import json, sys
           with open('/tmp/claude-result.json') as f:
               raw = json.load(f)
-          # Handle error cases (max_turns, timeout, etc.)
           subtype = raw.get('subtype', '')
           if subtype.startswith('error') or raw.get('is_error'):
-              msg = f\"Claude Code failed: {subtype or 'unknown error'}\"
+              msg = f"Claude Code failed: {subtype or 'unknown error'}"
               print(msg)
               with open('/tmp/claude-summary.txt', 'w') as f:
                   f.write(msg)
@@ -114,7 +120,7 @@ jobs:
               f.write(data['report'][:2800])
           if not data['all_passed']:
               sys.exit(1)
-          "
+          PYEOF
 
       - name: Notify failure via Slack
         if: failure() || cancelled()
@@ -125,26 +131,15 @@ jobs:
           REPO="${{ github.repository }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -f /tmp/claude-summary.txt ]; then
-            SUMMARY=$(cat /tmp/claude-summary.txt)
-          elif [ -f /tmp/claude-stderr.txt ]; then
+            SUMMARY=$(cat /tmp/claude-summary.txt | head -c 2800)
+          elif [ -f /tmp/claude-stderr.txt ] && [ -s /tmp/claude-stderr.txt ]; then
             SUMMARY=$(tail -20 /tmp/claude-stderr.txt | head -c 2800)
           else
             SUMMARY="No test output (server may have failed to start)"
           fi
-          SUMMARY_JSON=$(python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" <<< "$SUMMARY")
+          SUMMARY_ESCAPED=$(echo "$SUMMARY" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])")
           curl -sf "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' \
-            -d "$(python3 -c "
-          import json
-          blocks = [
-            {'type':'header','text':{'type':'plain_text','text':'CI Failed'}},
-            {'type':'section','fields':[
-              {'type':'mrkdwn','text':'*Repo:*\n$REPO'},
-              {'type':'mrkdwn','text':'*Summary:*\n' + json.loads($SUMMARY_JSON)[:2800]}
-            ]},
-            {'type':'section','text':{'type':'mrkdwn','text':'*Run:* <$RUN_URL|View logs>'}}
-          ]
-          print(json.dumps({'text':'CI failed for $REPO','blocks':blocks}))
-          ")"
+            -d "{\"text\":\"CI failed for $REPO\",\"blocks\":[{\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"CI Failed\"}},{\"type\":\"section\",\"fields\":[{\"type\":\"mrkdwn\",\"text\":\"*Repo:*\\n$REPO\"},{\"type\":\"mrkdwn\",\"text\":\"*Summary:*\\n$SUMMARY_ESCAPED\"}]},{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":\"*Run:* <$RUN_URL|View logs>\"}}]}"
 
   build-and-push:
     needs: test
