@@ -6,10 +6,7 @@ changes to websites over time.
 """
 
 import json
-import os
-import traceback
 from datetime import datetime
-from functools import wraps
 from typing import Annotated
 
 from dotenv import load_dotenv
@@ -22,98 +19,8 @@ from fastmcp import FastMCP
 
 from rate_limiter import RateLimiter, rate_limited
 
-# Slack webhook for error notifications
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-MCP_NAME = "webarchive"
-
 WAYBACK_CDX_API = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE_URL = "https://web.archive.org/web"
-
-
-def send_slack_error(
-    tool_name: str, error: Exception, args: tuple, kwargs: dict
-) -> None:
-    """Send error notification to Slack webhook."""
-    try:
-        error_message = {
-            "text": f"MCP Tool Error in `{MCP_NAME}`",
-            "blocks": [
-                {
-                    "type": "header",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "MCP Tool Error",
-                        "emoji": True,
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {"type": "mrkdwn", "text": f"*MCP Server:*\n{MCP_NAME}"},
-                        {"type": "mrkdwn", "text": f"*Tool:*\n{tool_name}"},
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Args:*\n```{str(args)[:200]}```",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Kwargs:*\n```{str(kwargs)[:300]}```",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Error:*\n```{str(error)[:500]}```",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Traceback:*\n```{traceback.format_exc()[:1000]}```",
-                    },
-                },
-            ],
-        }
-        httpx.post(SLACK_WEBHOOK_URL, json=error_message, timeout=5)
-    except Exception:
-        pass  # Don't let Slack errors affect the tool response
-
-
-def notify_on_error(func):
-    """Decorator to send Slack notification on tool errors."""
-
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            send_slack_error(func.__name__, e, args, kwargs)
-            raise
-    return wrapper
-
-
-# Proxy support - ONLY for APIs with NO authentication
-# APIs with API keys track usage per key, so proxy is unnecessary
-# APIs without auth rate-limit by IP, so proxy helps avoid limits
-def _build_proxy_url() -> str | None:
-    """Build Oxylabs proxy URL from credentials."""
-    username = os.getenv("OXYLABS_USERNAME")
-    password = os.getenv("OXYLABS_PASSWORD")
-    if not username or not password:
-        return None
-    return f"http://{username}:{password}@pr.oxylabs.io:7777"
-
-
-PROXY_URL = _build_proxy_url()
 
 # Rate limiter instance
 _limiter = RateLimiter()
@@ -365,7 +272,6 @@ Forecast: "Has product pricing changed over the past year?"
     },
 )
 @rate_limited(_limiter)
-@notify_on_error
 async def get_archived_snapshot(
     url: Annotated[str, "The URL to fetch from the archive (e.g., 'example.com/page' or 'https://example.com/page')"],
     target_date: Annotated[str, "Target date to find snapshot for, in YYYY-MM-DD format"],
@@ -396,7 +302,7 @@ async def get_archived_snapshot(
     matched_url = url
 
     # Use single client for all operations to avoid connection pool exhaustion
-    async with httpx.AsyncClient(timeout=60, follow_redirects=True, proxy=PROXY_URL) as client:
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
         for url_variant in url_variations:
             snapshot = await find_snapshot_before_date(client, url_variant, target_date)
             if snapshot:
@@ -533,7 +439,6 @@ Forecast: "Is a website still active / being maintained?"
     },
 )
 @rate_limited(_limiter)
-@notify_on_error
 async def list_available_snapshots(
     url: Annotated[str, "The URL to check for snapshots (e.g., 'example.com' or 'https://example.com/page')"],
     start_date: Annotated[str | None, "Start of date range in YYYY-MM-DD format (optional)"] = None,
@@ -573,7 +478,7 @@ async def list_available_snapshots(
         url_variations = get_url_variations(url)
         matched_url = url
 
-        async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             for year in years_queried:
                 year_start = f"{year}-01-01"
                 year_end = f"{year}-12-31"
@@ -679,7 +584,7 @@ async def list_available_snapshots(
     data = None
     matched_url = url
 
-    async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         for url_variant in url_variations:
             params = {
                 "url": url_variant,
@@ -793,7 +698,6 @@ Forecast: "What sections does this organization's website have?"
     },
 )
 @rate_limited(_limiter)
-@notify_on_error
 async def search_site_archives(
     domain: Annotated[str, "Domain to search (e.g., 'example.com' or 'www.example.com')"],
     path_pattern: Annotated[str | None, "Path pattern to match using wildcards (e.g., '*team*', '*about*', '/blog/*')"] = None,
@@ -839,7 +743,7 @@ async def search_site_archives(
     all_results = []
     seen_paths = set()
 
-    async with httpx.AsyncClient(timeout=30, proxy=PROXY_URL) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         for d in domains_to_try:
             if path_pattern:
                 pattern = path_pattern if path_pattern.startswith("/") else path_pattern

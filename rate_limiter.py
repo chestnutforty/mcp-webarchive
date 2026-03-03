@@ -14,7 +14,6 @@ Usage:
     # Apply to tools
     @mcp.tool(...)
     @rate_limited(limiter)
-    @notify_on_error
     def my_tool(...):
         ...
 """
