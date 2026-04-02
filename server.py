@@ -19,6 +19,18 @@ from fastmcp import FastMCP
 
 from rate_limiter import RateLimiter, rate_limited
 
+def _resolve_cutoff_date(cutoff_date: str | None = None) -> str:
+    """Resolve cutoff_date: env var > parameter > today."""
+    import os
+    env = os.environ.get("CUTOFF_DATE", "").strip()
+    if env:
+        return env
+    if cutoff_date:
+        return cutoff_date
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+
 WAYBACK_CDX_API = "https://web.archive.org/cdx/search/cdx"
 WAYBACK_BASE_URL = "https://web.archive.org/web"
 
@@ -275,7 +287,7 @@ Forecast: "Has product pricing changed over the past year?"
 async def get_archived_snapshot(
     url: Annotated[str, "The URL to fetch from the archive (e.g., 'example.com/page' or 'https://example.com/page')"],
     target_date: Annotated[str, "Target date to find snapshot for, in YYYY-MM-DD format"],
-    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
+    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = None,
 ) -> str:
     # Validate date format
     try:
@@ -447,7 +459,7 @@ async def list_available_snapshots(
     pick: Annotated[str | None, "Snapshot selection: 'closest_to_end', 'closest_to_start', 'closest_to_date', 'monthly', 'yearly'"] = None,
     target_date: Annotated[str | None, "Target date for 'closest_to_date' pick option (YYYY-MM-DD)"] = None,
     limit: Annotated[int, "Maximum number of snapshots to return (default 20, max 50)"] = 20,
-    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
+    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = None,
 ) -> str:
     # Validate and cap limit
     limit = min(max(1, limit), 50)
@@ -702,7 +714,7 @@ async def search_site_archives(
     domain: Annotated[str, "Domain to search (e.g., 'example.com' or 'www.example.com')"],
     path_pattern: Annotated[str | None, "Path pattern to match using wildcards (e.g., '*team*', '*about*', '/blog/*')"] = None,
     limit: Annotated[int, "Maximum number of unique paths to return (default 30, max 100)"] = 30,
-    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = datetime.now().strftime("%Y-%m-%d"),
+    cutoff_date: Annotated[str, "Cutoff date for backtesting (hidden from LLM)"] = None,
 ) -> str:
     from urllib.parse import urlparse
 
